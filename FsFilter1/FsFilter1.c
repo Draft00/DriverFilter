@@ -1,8 +1,8 @@
 #include <fltKernel.h>
 #include <dontuse.h>
+#include <stdio.h>
 
 #pragma prefast(disable:__WARNING_ENCODE_MEMBER_FUNCTION_POINTER, "Not valid for kernel mode drivers")
-
 
 PFLT_FILTER gFilterHandle;
 ULONG_PTR OperationStatusCtx = 1;
@@ -21,6 +21,8 @@ ULONG gTraceFlags = 0;
 #define DEVICE_SEND CTL_CODE(FILE_DEVICE_UNKNOWN,0x801,METHOD_BUFFERED,FILE_WRITE_DATA)//2 6:30
 #define DEVICE_REC CTL_CODE(FILE_DEVICE_UNKNOWN,0x802,METHOD_BUFFERED,FILE_READ_DATA)//2 7:30
 
+#define BUFFER_SIZE 4096
+#define LEN_MAX_PATH 560
 /*************************************************************************
     Prototypes
 *************************************************************************/
@@ -36,10 +38,13 @@ QUERY_INFO_PROCESS ZwQueryInformationProcess;
 
 struct FileInfo
 {
-    WCHAR FileName[260];
-    int IntLevel;
+    WCHAR FileName[LEN_MAX_PATH];
+    WCHAR IntLevel;
+    int object; 
 };
 struct FileInfo FileInfoList[50];
+unsigned int FileInfoListcount = 0;
+
 
 EXTERN_C_START
 
@@ -51,34 +56,8 @@ DriverEntry (
     );
 
 NTSTATUS
-FsFilter1InstanceSetup (
-    _In_ PCFLT_RELATED_OBJECTS FltObjects,
-    _In_ FLT_INSTANCE_SETUP_FLAGS Flags,
-    _In_ DEVICE_TYPE VolumeDeviceType,
-    _In_ FLT_FILESYSTEM_TYPE VolumeFilesystemType
-    );
-
-VOID
-FsFilter1InstanceTeardownStart (
-    _In_ PCFLT_RELATED_OBJECTS FltObjects,
-    _In_ FLT_INSTANCE_TEARDOWN_FLAGS Flags
-    );
-
-VOID
-FsFilter1InstanceTeardownComplete (
-    _In_ PCFLT_RELATED_OBJECTS FltObjects,
-    _In_ FLT_INSTANCE_TEARDOWN_FLAGS Flags
-    );
-
-NTSTATUS
 FsFilter1Unload (
     _In_ FLT_FILTER_UNLOAD_FLAGS Flags
-    );
-
-NTSTATUS
-FsFilter1InstanceQueryTeardown (
-    _In_ PCFLT_RELATED_OBJECTS FltObjects,
-    _In_ FLT_INSTANCE_QUERY_TEARDOWN_FLAGS Flags
     );
 
 FLT_PREOP_CALLBACK_STATUS
@@ -116,6 +95,30 @@ FsFilter1DoRequestOperationStatus(
     _In_ PFLT_CALLBACK_DATA Data
     );
 
+NTSTATUS
+ConfigFileParsing();
+
+NTSTATUS 
+DispatchPassThru(
+    PDEVICE_OBJECT DeviceObject, 
+    PIRP Irp
+    );
+
+NTSTATUS
+DispatchDevCTL(
+    PDEVICE_OBJECT DeviceObject, 
+    PIRP Irp
+    );
+
+int FindInConfig(WCHAR* Path, int* flag);
+
+void PcreateProcessNotifyRoutine(
+    HANDLE ParentId,
+    HANDLE ProcessId,
+    BOOLEAN Create
+);
+
+void PrintStringInFile(void);
 EXTERN_C_END
 
 //
@@ -125,10 +128,8 @@ EXTERN_C_END
 #ifdef ALLOC_PRAGMA
 #pragma alloc_text(INIT, DriverEntry)
 #pragma alloc_text(PAGE, FsFilter1Unload)
-#pragma alloc_text(PAGE, FsFilter1InstanceQueryTeardown)
-#pragma alloc_text(PAGE, FsFilter1InstanceSetup)
-#pragma alloc_text(PAGE, FsFilter1InstanceTeardownStart)
-#pragma alloc_text(PAGE, FsFilter1InstanceTeardownComplete)
+#pragma alloc_text(PAGE, DispatchDevCTL)
+#pragma alloc_text(PAGE, DispatchPassThru)
 #endif
 
 //
@@ -142,16 +143,16 @@ CONST FLT_OPERATION_REGISTRATION Callbacks[] = {
       FsFilter1PreOperation,
       FsFilter1PostOperation },
 
-    /*{ IRP_MJ_READ,
+    { IRP_MJ_READ,
       0,
       FsFilter1PreOperation,
-      FsFilter1PostOperation },*/
+      FsFilter1PostOperation },
 
     { IRP_MJ_WRITE,
       0,
       FsFilter1PreOperation,
       FsFilter1PostOperation },
-
+      
     { IRP_MJ_OPERATION_END }
 };
 
@@ -181,160 +182,35 @@ CONST FLT_REGISTRATION FilterRegistration = {
 
 };
 
-
-
-NTSTATUS
-FsFilter1InstanceSetup (
-    _In_ PCFLT_RELATED_OBJECTS FltObjects,
-    _In_ FLT_INSTANCE_SETUP_FLAGS Flags,
-    _In_ DEVICE_TYPE VolumeDeviceType,
-    _In_ FLT_FILESYSTEM_TYPE VolumeFilesystemType
-    )
-/*++
-
-Routine Description:
-
-    This routine is called whenever a new instance is created on a volume. This
-    gives us a chance to decide if we need to attach to this volume or not.
-
-    If this routine is not defined in the registration structure, automatic
-    instances are always created.
-
-Arguments:
-
-    FltObjects - Pointer to the FLT_RELATED_OBJECTS data structure containing
-        opaque handles to this filter, instance and its associated volume.
-
-    Flags - Flags describing the reason for this attach request.
-
-Return Value:
-
-    STATUS_SUCCESS - attach
-    STATUS_FLT_DO_NOT_ATTACH - do not attach
-
---*/
+int FindInConfig(WCHAR* Path, int* flag)
 {
-    UNREFERENCED_PARAMETER( FltObjects );
-    UNREFERENCED_PARAMETER( Flags );
-    UNREFERENCED_PARAMETER( VolumeDeviceType );
-    UNREFERENCED_PARAMETER( VolumeFilesystemType );
+    if (FileInfoListcount == 0)
+        return 0;
 
-    PAGED_CODE();
+    for (int i = 0; i < FileInfoListcount; i++)
+    {
+        if (wcscmp(Path, FileInfoList[i].FileName) == 0)
+        {
+            if (FileInfoList[i].object == 1)
+            {
+                *flag = 1;
+            }
 
-    PT_DBG_PRINT( PTDBG_TRACE_ROUTINES,
-                  ("FsFilter1!FsFilter1InstanceSetup: Entered\n") );
+            if (FileInfoList[i].IntLevel == L'1')
+                return 1;
+            else if (FileInfoList[i].IntLevel == L'2')
+                return 2;
+            else if (FileInfoList[i].IntLevel == L'3')
+                return 3;
+            else if (FileInfoList[i].IntLevel == L'4')
+                return 4;
+            else if (FileInfoList[i].IntLevel == L'5')
+                return 5;
+            else return 6;
+        }
+    }
 
-    return STATUS_SUCCESS;
-}
-
-
-NTSTATUS
-FsFilter1InstanceQueryTeardown (
-    _In_ PCFLT_RELATED_OBJECTS FltObjects,
-    _In_ FLT_INSTANCE_QUERY_TEARDOWN_FLAGS Flags
-    )
-/*++
-
-Routine Description:
-
-    This is called when an instance is being manually deleted by a
-    call to FltDetachVolume or FilterDetach thereby giving us a
-    chance to fail that detach request.
-
-    If this routine is not defined in the registration structure, explicit
-    detach requests via FltDetachVolume or FilterDetach will always be
-    failed.
-
-Arguments:
-
-    FltObjects - Pointer to the FLT_RELATED_OBJECTS data structure containing
-        opaque handles to this filter, instance and its associated volume.
-
-    Flags - Indicating where this detach request came from.
-
-Return Value:
-
-    Returns the status of this operation.
-
---*/
-{
-    UNREFERENCED_PARAMETER( FltObjects );
-    UNREFERENCED_PARAMETER( Flags );
-
-    PAGED_CODE();
-
-    PT_DBG_PRINT( PTDBG_TRACE_ROUTINES,
-                  ("FsFilter1!FsFilter1InstanceQueryTeardown: Entered\n") );
-
-    return STATUS_SUCCESS;
-}
-
-
-VOID
-FsFilter1InstanceTeardownStart (
-    _In_ PCFLT_RELATED_OBJECTS FltObjects,
-    _In_ FLT_INSTANCE_TEARDOWN_FLAGS Flags
-    )
-/*++
-
-Routine Description:
-
-    This routine is called at the start of instance teardown.
-
-Arguments:
-
-    FltObjects - Pointer to the FLT_RELATED_OBJECTS data structure containing
-        opaque handles to this filter, instance and its associated volume.
-
-    Flags - Reason why this instance is being deleted.
-
-Return Value:
-
-    None.
-
---*/
-{
-    UNREFERENCED_PARAMETER( FltObjects );
-    UNREFERENCED_PARAMETER( Flags );
-
-    PAGED_CODE();
-
-    PT_DBG_PRINT( PTDBG_TRACE_ROUTINES,
-                  ("FsFilter1!FsFilter1InstanceTeardownStart: Entered\n") );
-}
-
-
-VOID
-FsFilter1InstanceTeardownComplete (
-    _In_ PCFLT_RELATED_OBJECTS FltObjects,
-    _In_ FLT_INSTANCE_TEARDOWN_FLAGS Flags
-    )
-/*++
-
-Routine Description:
-
-    This routine is called at the end of instance teardown.
-
-Arguments:
-
-    FltObjects - Pointer to the FLT_RELATED_OBJECTS data structure containing
-        opaque handles to this filter, instance and its associated volume.
-
-    Flags - Reason why this instance is being deleted.
-
-Return Value:
-
-    None.
-
---*/
-{
-    UNREFERENCED_PARAMETER( FltObjects );
-    UNREFERENCED_PARAMETER( Flags );
-
-    PAGED_CODE();
-
-    PT_DBG_PRINT( PTDBG_TRACE_ROUTINES,
-                  ("FsFilter1!FsFilter1InstanceTeardownComplete: Entered\n") );
+    return 0;
 }
 
 NTSTATUS
@@ -417,9 +293,16 @@ PDEVICE_OBJECT DeviceObject = NULL;
 
 VOID Unload(PDRIVER_OBJECT DriverObject)
 {
+    NTSTATUS status = STATUS_SUCCESS;
     IoDeleteSymbolicLink(&SymLinkName);
     IoDeleteDevice(DeviceObject);
-    KdPrint(("Driver unloaded successfully\r\n"));
+
+    //delete notification
+    status = PsSetCreateProcessNotifyRoutine(PcreateProcessNotifyRoutine, TRUE);
+    if (!NT_SUCCESS(status)) {
+        DbgPrint("Already removed Notify\n");
+    }
+    KdPrint(("[Flt1]Driver unloaded successfully\r\n"));
 }
 
 NTSTATUS DispatchPassThru(PDEVICE_OBJECT DeviceObject, PIRP Irp)
@@ -461,10 +344,12 @@ NTSTATUS DispatchPassThru(PDEVICE_OBJECT DeviceObject, PIRP Irp)
     return status;
 
 }
+
 NTSTATUS DispatchDevCTL(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 {
     PIO_STACK_LOCATION irpsp = IoGetCurrentIrpStackLocation(Irp);
     NTSTATUS status = STATUS_SUCCESS;
+    NTSTATUS status_parse = STATUS_SUCCESS;
 
     //sending and receiving data
     //we need te retrieve the system buffer
@@ -473,15 +358,40 @@ NTSTATUS DispatchDevCTL(PDEVICE_OBJECT DeviceObject, PIRP Irp)
     ULONG outlength = irpsp->Parameters.DeviceIoControl.OutputBufferLength;//buffer len in receiving function
     ULONG returnlength = 0;
 
-    //!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
     WCHAR* demo = L"sample returned from driver";
-    //!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
     switch (irpsp->Parameters.DeviceIoControl.IoControlCode)
     {
     case DEVICE_SEND:
     {
-        //need to check that buffer is null-terminated
+        DbgPrint("Send device!\n");
+        if (wcscmp(buffer, L"update") == 0)
+        {
+            status_parse = ConfigFileParsing();
+            if (status_parse) {
+                DbgPrint("[ERRFlt1]ConfigFileParsing\n");
+            }
+        }
+        else if (wcscmp(buffer, L"setnotify") == 0)
+        {
+            status = PsSetCreateProcessNotifyRoutine(PcreateProcessNotifyRoutine, FALSE);
+            if (!NT_SUCCESS(status)) {
+                DbgPrint("[ERRFlt1]PsSetLoadImageNotifyRoutine failed. Status 0x%x\n", status);
+            }
+            else {
+                DbgPrint("[Flt1]: PsSetLoadImageNotifyRoutine\n");
+            }
+        }
+        else if (wcscmp(buffer, L"removenotify") == 0)
+        {
+            status = PsSetCreateProcessNotifyRoutine(PcreateProcessNotifyRoutine, TRUE);
+            if (!NT_SUCCESS(status)) {
+                DbgPrint("[ERRFlt1]PsSetLoadImageNotifyRoutine REMOVE failed. Status 0x%x\n", status);
+            }
+            else {
+                DbgPrint("[Flt1]: PsSetLoadImageNotifyRoutine REMOVE\n");
+            }
+        }
         DbgPrint("recveive data is %ws\n", buffer);
         returnlength = (wcsnlen(buffer, 511) + 1) * 2;
         break;
@@ -523,14 +433,14 @@ DriverEntry (
 
     UNREFERENCED_PARAMETER( RegistryPath );
 
-    DbgPrint("DBG!FsFilter1!DriverEntry: Entered\n");
+    DbgPrint("[Flt1]DriverEntry: Entered\n");
 
     DriverObject->DriverUnload = Unload;
+
     status = IoCreateDevice(DriverObject, 0, &DeviceName, FILE_DEVICE_UNKNOWN, FILE_DEVICE_SECURE_OPEN, FALSE, &DeviceObject);
 
     if (!NT_SUCCESS(status))
     {
-        //create device failed
         DbgPrint("creating device failed\n");
         return status;
     }
@@ -538,7 +448,6 @@ DriverEntry (
     status = IoCreateSymbolicLink(&SymLinkName, &DeviceName);
     if (!NT_SUCCESS(status))
     {
-        //create sym link failed
         DbgPrint(("creating sym link failed\n"));
         //as we couldn't make link we need to delete the created device
         IoDeleteDevice(DeviceObject);
@@ -555,7 +464,7 @@ DriverEntry (
     DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = DispatchDevCTL;
     //DriverObject->MajorFunction[IRP_MJ_WRITE] = DispatchCustom1;
 
-    KdPrint(("Driver loaded successfully\r\n"));
+    KdPrint(("[Flt1]Driver loaded successfully\r\n"));
 
 
     status = FltRegisterFilter( DriverObject,
@@ -586,13 +495,174 @@ FsFilter1Unload (
 
     PAGED_CODE();
 
-    DbgPrint("FsFilter1!FsFilter1Unload: Entered\n");
+    DbgPrint("[Flt1]FsFilter1Unload: Entered\n");
 
     FltUnregisterFilter( gFilterHandle );
 
     return STATUS_SUCCESS;
 }
 
+/*************************************************************************
+    MyFunk. For config file
+*************************************************************************/
+
+NTSTATUS ConfigFileParsing()
+{
+    DbgPrint("[Flt1]: ConfigFileParsing started!\n");
+
+    NTSTATUS status;
+    UNICODE_STRING UnicodeFileName;
+    OBJECT_ATTRIBUTES FileAttributes;
+    HANDLE Handle;
+    IO_STATUS_BLOCK IoStatusBlock;
+    //RtlInitUnicodeString(&UnicodeFileName, L"\\Device\\HarddiskVolume2\\Users\\Sergey\\Desktop\\config.txt");
+    RtlInitUnicodeString(&UnicodeFileName, L"\\Device\\HarddiskVolume2\\Users\\Sergey\\Desktop\\config.csv");
+    InitializeObjectAttributes(&FileAttributes, &UnicodeFileName, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+
+    if (KeGetCurrentIrql() != PASSIVE_LEVEL)
+        return STATUS_INVALID_DEVICE_STATE;
+
+    status = ZwCreateFile(&Handle,
+        GENERIC_READ,
+        &FileAttributes, 
+        &IoStatusBlock,
+        NULL,
+        FILE_ATTRIBUTE_NORMAL,
+        0,
+        FILE_OPEN,
+        FILE_SYNCHRONOUS_IO_NONALERT,
+        NULL, 0);
+
+    char buffer[BUFFER_SIZE];
+    memset(buffer, 0, BUFFER_SIZE);
+
+    //DbgPrint("Start memset\n");
+
+    memset(FileInfoList, 0, sizeof(struct FileInfo)*50);
+
+    //DbgPrint("Memset ok!\n");
+
+    if (status == STATUS_SUCCESS)
+    {
+        LARGE_INTEGER byteOffset;
+        byteOffset.LowPart = 0;
+        byteOffset.HighPart = 0;
+        status = ZwReadFile(Handle, NULL, NULL, NULL, &IoStatusBlock,
+            buffer, BUFFER_SIZE, &byteOffset, NULL);
+
+        if (status == STATUS_SUCCESS)
+        {
+            FileInfoListcount = 0;
+            DbgPrint("BUFFER: %s", buffer);
+            
+            unsigned int i = 0, index_in_filename = 0;
+            while (buffer[i] != 0)
+            {
+                while (buffer[i] != ',') {
+                    FileInfoList[FileInfoListcount].FileName[index_in_filename] = buffer[i];
+                    i++; index_in_filename++;
+                }
+                i++; //skip ','
+                if (buffer[i] == '1')
+                {
+                    FileInfoList[FileInfoListcount].object = 1;
+                }
+                else if ((buffer[i] == '0'))
+                {
+                    FileInfoList[FileInfoListcount].object = 0;
+                }
+                i += 2;
+                
+                index_in_filename = 0;
+                FileInfoList[FileInfoListcount].IntLevel = buffer[i];
+                DbgPrint("Name: %ws, IntLvl: %wc, obj: %d\n", FileInfoList[FileInfoListcount].FileName, FileInfoList[FileInfoListcount].IntLevel, FileInfoList[FileInfoListcount].object);
+                FileInfoListcount++;
+                i += 3; //skip number and '\n' (seems it's 2 byte??)
+                //DbgPrint("Buffer: %c, %d\n", buffer[i], buffer[i]);
+                //DbgPrint("Buffer: %c, %d\n", buffer[i + 1], buffer[i + 1]);
+            }
+            
+            //return STATUS_SUCCESS;
+            
+        }
+        else
+        {
+            DbgPrint("[ERRFlt1]: ZWReadfile\n");
+            ZwClose(Handle);
+            return !STATUS_SUCCESS;
+        }
+    }
+    else
+    {
+        DbgPrint("[ERRFlt1]: ZWCreatefile\n");
+        ZwClose(Handle);
+        return !STATUS_SUCCESS;
+    }
+    ZwClose(Handle);
+    return STATUS_SUCCESS;
+}
+
+char str[2048] = { 0 };
+void PcreateProcessNotifyRoutine(HANDLE ParentId, HANDLE ProcessId, BOOLEAN Create)
+{
+    LARGE_INTEGER SystemTime;
+    TIME_FIELDS TimeFields;
+
+    KeQuerySystemTime(&SystemTime);
+    RtlTimeToTimeFields(&SystemTime, &TimeFields);
+    PUNICODE_STRING processName = NULL;
+    NTSTATUS status;
+    status = GetProcessImageName(PsGetCurrentProcess(), &processName);
+
+    memset(str, 0, 2048);
+    if (Create) {
+        sprintf(str, "Created Process Name: %ws Process Id: %u Time: %i : %i : %i\n", processName->Buffer, PtrToInt(ProcessId), TimeFields.Hour, TimeFields.Minute, TimeFields.Second);
+    }
+    else sprintf(str, "Deleted Process Name: %ws Process Id: %u Time: %i : %i : %i\n", processName->Buffer, PtrToInt(ProcessId), TimeFields.Hour, TimeFields.Minute, TimeFields.Second);
+    DbgPrint("[Flt1]Some process del or create\n");
+    PrintStringInFile();
+
+}
+
+void PrintStringInFile()
+{
+    NTSTATUS status;
+    UNICODE_STRING UnicodeFileName;
+    OBJECT_ATTRIBUTES FileAttributes;
+    HANDLE Handle;
+    IO_STATUS_BLOCK IoStatusBlock;
+    RtlInitUnicodeString(&UnicodeFileName, L"\\Device\\HarddiskVolume2\\Users\\Sergey\\Desktop\\log.txt");
+    InitializeObjectAttributes(&FileAttributes, &UnicodeFileName, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+    if (KeGetCurrentIrql() != PASSIVE_LEVEL)
+        return;
+
+
+    status = ZwCreateFile(&Handle,
+        FILE_APPEND_DATA,
+        &FileAttributes, &IoStatusBlock,
+        NULL,
+        FILE_ATTRIBUTE_NORMAL,
+        0,
+        FILE_OPEN,
+        FILE_SYNCHRONOUS_IO_NONALERT,
+        NULL, 0);
+
+    if (status == STATUS_SUCCESS)
+    {
+        ULONG buffer_size = (ULONG)strlen(str);
+        status = ZwWriteFile(Handle, NULL, NULL, NULL, &IoStatusBlock,
+            str, buffer_size, NULL, NULL);
+        //GlobalByteOffset.LowPart += buffer_size;
+        if (status == STATUS_SUCCESS)
+            DbgPrint("[Flt1]: PrintStringInFile successfully!\n");
+        else
+            DbgPrint("[ERRFlt1]: PrintStringInFile (ZwWriteFile) failed!\n");
+    }
+    else
+        DbgPrint("[ERRFlt1]: PrintStringInFile (ZwCreateFile) failed!\n");
+
+    ZwClose(Handle);
+}
 
 /*************************************************************************
     MiniFilter callback routines.
@@ -605,13 +675,16 @@ FsFilter1PreOperation (
     )
 {
     NTSTATUS status;
-    WCHAR Name[200] = { 0 };
+    WCHAR Name[LEN_MAX_PATH] = { 0 };
+    WCHAR NameProcess[LEN_MAX_PATH] = { 0 };
+    int IntLvlFile = 0, IntLvlProcess = 0;
+    int flag_object = 0;
 
     PFLT_FILE_NAME_INFORMATION FileNameInfo;
     UNREFERENCED_PARAMETER( FltObjects );
     UNREFERENCED_PARAMETER( CompletionContext );
 
-    DbgPrint("FsFilter1!FsFilter1PreOperation: Entered\n");
+    //DbgPrint("[Flt1]PreOperation: Entered\n");
 
     status = FltGetFileNameInformation(Data, FLT_FILE_NAME_NORMALIZED | FLT_FILE_NAME_QUERY_DEFAULT, &FileNameInfo);
 
@@ -620,22 +693,62 @@ FsFilter1PreOperation (
         status = FltParseFileNameInformation(FileNameInfo);
         if (NT_SUCCESS(status))
         {
-            if (FileNameInfo->Name.MaximumLength < 260)
+            if (FileNameInfo->Name.MaximumLength < LEN_MAX_PATH)
             {
                 RtlCopyMemory(Name, FileNameInfo->Name.Buffer, FileNameInfo->Name.MaximumLength);
-              
-                if (wcsstr(Name, L"OPENME.txt") != NULL)
+
+                flag_object = 0;
+                IntLvlFile = FindInConfig(Name, &flag_object);
+                if (IntLvlFile && flag_object)
                 {
                     PUNICODE_STRING processName = NULL;
                     GetProcessImageName(PsGetCurrentProcess(), &processName);
-                    //RtlCopyMemory(wprocessName, processName->Buffer, processName->MaximumLength);
-                    DbgPrint("Write file %ws blocked for process %ws\n", Name, processName->Buffer);
-                    Data->IoStatus.Status = STATUS_INVALID_PARAMETER;
-                    Data->IoStatus.Information = 0;
-                    FltReleaseFileNameInformation(FileNameInfo);
-                    return FLT_PREOP_COMPLETE;
+                    RtlCopyMemory(NameProcess, processName->Buffer, processName->MaximumLength);
+                    DbgPrint("Name od pr: %ws\n", NameProcess);
+                    IntLvlProcess = FindInConfig(NameProcess, &flag_object);
+                    if (IntLvlProcess)
+                    {
+                        DbgPrint("IntLvl %d for process: %ws\n", IntLvlProcess, processName->Buffer);
+                        if (IntLvlFile > IntLvlProcess)
+                        {
+                            DbgPrint("Open file %ws blocked for process %ws\n", Name, processName->Buffer);
+                            Data->IoStatus.Status = STATUS_ACCESS_DENIED;
+                            Data->IoStatus.Information = 0;
+                           
+                            FltReleaseFileNameInformation(FileNameInfo);
+                            return FLT_PREOP_COMPLETE;
+                        }
+                    }
+                    else if (IntLvlFile > 3 && flag_object)
+                    {
+                        //PUNICODE_STRING processName = NULL;
+                       // GetProcessImageName(PsGetCurrentProcess(), &processName);
+                        //RtlCopyMemory(NameProcess, processName->Buffer, processName->MaximumLength);
+                       // if (wcscmp(NameProcess, L"\\Device\\HarddiskVolume2\\Windows\\explorer.exe") != 0)
+                       // {
+                            DbgPrint("Open file %ws blocked for process %ws\n", Name, processName->Buffer);
+                            Data->IoStatus.Status = STATUS_ACCESS_DENIED;
+                            Data->IoStatus.Information = 0;
+                            FltReleaseFileNameInformation(FileNameInfo);
+                            return FLT_PREOP_COMPLETE;
+                       // }
+                    }
+                    
                 }
-                DbgPrint("create file: %ws\r\n", Name);
+                else if (wcscmp(Name, L"\\Device\\HarddiskVolume2\\Users\\Sergey\\Desktop\\config.csv") == 0)
+                {
+                    PUNICODE_STRING processName = NULL;
+                    GetProcessImageName(PsGetCurrentProcess(), &processName);
+                    if (wcscmp(processName->Buffer, L"\\Device\\HarddiskVolume2\\Users\\Sergey\\Desktop\\userapp.exe") != 0)
+                    {
+                        DbgPrint("Open CONFIG file %ws blocked for process %ws\n", Name, processName->Buffer);
+                        Data->IoStatus.Status = STATUS_ACCESS_DENIED;
+                        Data->IoStatus.Information = 0;
+                        FltReleaseFileNameInformation(FileNameInfo);
+                        return FLT_PREOP_COMPLETE;
+                    }
+                }
+                
             }
         }
         FltReleaseFileNameInformation(FileNameInfo);
@@ -716,7 +829,7 @@ FsFilter1PostOperation (
 
    // PT_DBG_PRINT( PTDBG_TRACE_ROUTINES,
               //    ("FsFilter1!FsFilter1PostOperation: Entered\n") );
-    DbgPrint("FsFilter1!FsFilter1PostOperation: Entered\n");
+    //DbgPrint("[Flt1]PostOperation: Entered\n");
     return FLT_POSTOP_FINISHED_PROCESSING;
 }
 
